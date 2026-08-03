@@ -1,0 +1,28 @@
+# requirements.txt
+# -----------------
+# Purpose: Pins the free, open-source dependencies needed to run
+# MarketMind-AI. Kept minimal for this first "skeleton only" version;
+# more packages will be added as each layer (data, analysis, strategies,
+# models) gets implemented.
+#
+# Install with:
+#   pip install -r requirements.txt
+
+# --- Testing ---
+pytest==8.3.3            # Free, standard unit testing framework
+
+# --- Data handling (used later by data/ and analysis/) ---
+pandas==2.2.3            # Data manipulation for OHLCV market data
+numpy==2.1.3             # Numerical computing backbone
+
+# --- Binance integration (free public API) ---
+python-binance==1.0.22   # Free Binance REST/WebSocket client
+
+# --- Environment / configuration ---
+python-dotenv==1.0.1     # Loads .env files for local development
+
+# --- HTTP requests (used later by data/ and services/ for news, etc.) ---
+requests==2.32.3         # Simple HTTP client for free news/data APIs
+
+# --- Database (free, local, no external server) ---
+SQLAlchemy==2.0.36        # ORM for the database/ layer (SQLite by default)
