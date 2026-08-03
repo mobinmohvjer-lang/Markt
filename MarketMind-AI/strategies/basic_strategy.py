@@ -105,11 +105,8 @@ from strategies.utils import clip
 DEFAULT_ANALYSIS_ANALYZER_NAME = "AnalysisAggregator"
 
 #: Combined score strictly above this value is `SignalDirection.BUY`.
+DEFAULT_SELL_THRESHOLD = -0.2                             
 DEFAULT_BUY_THRESHOLD = 0.2
-
-#: Combined score strictly below this value is `SignalDirection.SELL`.
-DEFAULT_SELL_THRESHOLD = -0.2
-
 #: Default relative weights for combining the analysis-derived score
 #: and the signal-derived score into `overall_score`. Analysis is
 #: weighted higher by default since it is the one required input;

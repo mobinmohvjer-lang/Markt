@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+*.db
+*.csv
+*.zip
+logs/
+*.bak
+*_backup.py
+*_old.py
+*.pyy
+*.pyyx
+PY
+from
+marketmind_files.txt
