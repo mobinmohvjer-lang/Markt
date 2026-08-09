@@ -31,6 +31,19 @@ from strategies.risk_management.result import RiskResult
 NOW = datetime.now(timezone.utc)
 
 
+def make_passing_indicators() -> dict:
+    """Indicator values that clear all three BasicStrategy entry filters."""
+    return {
+        "indicators": {
+            "ema_50": 105.0,
+            "ema_200": 100.0,
+            "adx": 30.0,
+            "atr": 2.5,
+            "atr_ma_20": 2.0,
+        }
+    }
+
+
 def make_analysis_result(
     *, analyzer_name: str = "AnalysisAggregator", score: float = 0.6, confidence: float = 0.8
 ) -> AnalysisResult:
@@ -73,6 +86,7 @@ def make_context(
     analysis_results=None,
     signal_result=None,
     risk_result=None,
+    metadata=None,
 ) -> StrategyContext:
     return StrategyContext(
         symbol="BTCUSDT",
@@ -80,6 +94,11 @@ def make_context(
         analysis_results=analysis_results if analysis_results is not None else [make_analysis_result()],
         signal_result=signal_result,
         risk_result=risk_result,
+        # Entry-filter indicators default to values that pass all three
+        # filters, so existing BUY-decision tests (written before the
+        # entry filters existed) keep behaving the same unless a test
+        # explicitly overrides `metadata` to exercise a filter.
+        metadata=metadata if metadata is not None else make_passing_indicators(),
     )
 
 
@@ -136,6 +155,42 @@ class TestConstruction(unittest.TestCase):
         # Zero is a valid (if degenerate) weight -- must not raise.
         strategy = BasicStrategy(signal_weight=0.0)
         self.assertEqual(strategy.signal_weight, 0.0)
+
+    def test_default_entry_filter_configuration(self):
+        strategy = BasicStrategy()
+        self.assertEqual(strategy.entry_filter_metadata_key, "indicators")
+        self.assertEqual(strategy.ema_fast_key, "ema_50")
+        self.assertEqual(strategy.ema_slow_key, "ema_200")
+        self.assertEqual(strategy.adx_key, "adx")
+        self.assertAlmostEqual(strategy.adx_threshold, 25.0)
+        self.assertEqual(strategy.atr_key, "atr")
+        self.assertEqual(strategy.atr_ma_key, "atr_ma_20")
+
+    def test_rejects_empty_entry_filter_key_names(self):
+        for kwarg in (
+            "entry_filter_metadata_key",
+            "ema_fast_key",
+            "ema_slow_key",
+            "adx_key",
+            "atr_key",
+            "atr_ma_key",
+        ):
+            with self.assertRaises(StrategyConfigurationError):
+                BasicStrategy(**{kwarg: "   "})
+
+    def test_rejects_non_numeric_adx_threshold(self):
+        with self.assertRaises(StrategyConfigurationError):
+            BasicStrategy(adx_threshold="strong")
+
+    def test_rejects_adx_threshold_out_of_range(self):
+        with self.assertRaises(StrategyConfigurationError):
+            BasicStrategy(adx_threshold=-1.0)
+        with self.assertRaises(StrategyConfigurationError):
+            BasicStrategy(adx_threshold=100.1)
+
+    def test_custom_adx_threshold_is_accepted(self):
+        strategy = BasicStrategy(adx_threshold=40.0)
+        self.assertAlmostEqual(strategy.adx_threshold, 40.0)
 
 
 # ----------------------------------------------------------------------
@@ -299,6 +354,202 @@ class TestRiskGate(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
+# Entry filters (BUY only): EMA50 > EMA200, ADX >= 25, ATR > ATR MA20
+# ----------------------------------------------------------------------
+class TestEntryFilters(unittest.TestCase):
+    def _bullish_context(self, *, metadata) -> StrategyContext:
+        return make_context(
+            analysis_results=[make_analysis_result(score=0.8, confidence=0.9)],
+            signal_result=make_signal_result(direction=SignalDirection.BUY, strength=0.8),
+            risk_result=make_risk_result(approved=True),
+            metadata=metadata,
+        )
+
+    def test_all_filters_passing_keeps_buy(self):
+        strategy = BasicStrategy()
+        context = self._bullish_context(metadata=make_passing_indicators())
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.BUY)
+        self.assertFalse(result.metadata["entry_filter_override"])
+        self.assertTrue(result.metadata["entry_filters"]["available"])
+        self.assertTrue(result.metadata["entry_filters"]["passed"])
+
+    def test_ema50_not_above_ema200_downgrades_to_hold(self):
+        strategy = BasicStrategy()
+        metadata = make_passing_indicators()
+        metadata["indicators"]["ema_50"] = 99.0  # below EMA200 -> filter fails
+        context = self._bullish_context(metadata=metadata)
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.HOLD)
+        self.assertTrue(result.metadata["entry_filter_override"])
+        self.assertEqual(result.metadata["raw_action"], "buy")
+        self.assertFalse(result.metadata["entry_filters"]["ema_trend"]["passed"])
+        self.assertTrue(result.metadata["entry_filters"]["adx"]["passed"])
+        self.assertTrue(result.metadata["entry_filters"]["atr_expansion"]["passed"])
+
+    def test_adx_below_threshold_downgrades_to_hold(self):
+        strategy = BasicStrategy()
+        metadata = make_passing_indicators()
+        metadata["indicators"]["adx"] = 24.99  # just under the default 25 threshold
+        context = self._bullish_context(metadata=metadata)
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.HOLD)
+        self.assertTrue(result.metadata["entry_filter_override"])
+        self.assertFalse(result.metadata["entry_filters"]["adx"]["passed"])
+
+    def test_adx_exactly_at_threshold_passes(self):
+        # Requirement is ADX >= 25, so exactly 25 must pass.
+        strategy = BasicStrategy()
+        metadata = make_passing_indicators()
+        metadata["indicators"]["adx"] = 25.0
+        context = self._bullish_context(metadata=metadata)
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.BUY)
+        self.assertTrue(result.metadata["entry_filters"]["adx"]["passed"])
+
+    def test_atr_not_above_its_moving_average_downgrades_to_hold(self):
+        strategy = BasicStrategy()
+        metadata = make_passing_indicators()
+        metadata["indicators"]["atr"] = 1.5  # below its own 20-candle MA -> filter fails
+        context = self._bullish_context(metadata=metadata)
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.HOLD)
+        self.assertTrue(result.metadata["entry_filter_override"])
+        self.assertFalse(result.metadata["entry_filters"]["atr_expansion"]["passed"])
+
+    def test_no_indicator_metadata_supplied_downgrades_to_hold(self):
+        # Entry filters are mandatory: with no "indicators" key at all on
+        # context.metadata, there isn't enough data to confirm the trend/
+        # volatility filters, so a would-be BUY fails closed to HOLD
+        # rather than being let through unchecked.
+        strategy = BasicStrategy()
+        context = self._bullish_context(metadata={})
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.HOLD)
+        self.assertTrue(result.metadata["entry_filter_override"])
+        self.assertFalse(result.metadata["entry_filters"]["available"])
+
+    def test_partial_indicators_fail_closed_to_hold(self):
+        # Missing individual values inside the "indicators" dict are
+        # treated strictly, the same as the dict being absent entirely.
+        strategy = BasicStrategy()
+        metadata = {"indicators": {"ema_50": 105.0, "ema_200": 100.0}}  # no adx/atr
+        context = self._bullish_context(metadata=metadata)
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.HOLD)
+        self.assertTrue(result.metadata["entry_filter_override"])
+
+    def test_non_numeric_indicators_fail_closed_to_hold(self):
+        strategy = BasicStrategy()
+        metadata = make_passing_indicators()
+        metadata["indicators"]["adx"] = "strong"
+        context = self._bullish_context(metadata=metadata)
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.HOLD)
+        self.assertFalse(result.metadata["entry_filters"]["adx"]["passed"])
+
+    def test_entry_filters_do_not_affect_sell_decisions(self):
+        strategy = BasicStrategy()
+        context = make_context(
+            analysis_results=[make_analysis_result(score=-0.8, confidence=0.9)],
+            signal_result=make_signal_result(direction=SignalDirection.SELL, strength=0.8),
+            risk_result=make_risk_result(approved=True),
+            metadata={},  # no indicator data at all
+        )
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.SELL)
+        self.assertFalse(result.metadata["entry_filter_override"])
+
+    def test_entry_filters_do_not_affect_hold_decisions(self):
+        strategy = BasicStrategy()
+        context = make_context(
+            analysis_results=[make_analysis_result(score=0.05, confidence=0.9)],
+            metadata={},  # no indicator data at all
+        )
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.HOLD)
+        self.assertFalse(result.metadata["entry_filter_override"])
+
+    def test_entry_filter_override_does_not_double_downgrade_with_risk_override(self):
+        # Risk already downgrades this BUY to HOLD -- entry filters must
+        # not additionally fire once the action is already HOLD.
+        strategy = BasicStrategy()
+        metadata = make_passing_indicators()
+        metadata["indicators"]["adx"] = 5.0  # would also fail the entry filter
+        context = self._bullish_context(metadata=metadata)
+        context = StrategyContext(
+            symbol=context.symbol,
+            timeframe=context.timeframe,
+            analysis_results=context.analysis_results,
+            signal_result=context.signal_result,
+            risk_result=make_risk_result(approved=False),
+            metadata=context.metadata,
+        )
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.HOLD)
+        self.assertTrue(result.metadata["risk_override"])
+        self.assertFalse(result.metadata["entry_filter_override"])
+
+    def test_existing_entry_logic_unaffected_when_filters_pass(self):
+        # Same overall_score/confidence math as before the filters were
+        # added -- filters only gate the final action, they never touch
+        # scoring/consistency/confidence.
+        strategy = BasicStrategy()
+        context = self._bullish_context(metadata=make_passing_indicators())
+        result = strategy.decide(context)
+        self.assertGreater(result.metadata["overall_score"], strategy.buy_threshold)
+        self.assertAlmostEqual(
+            result.metadata["consistency"]["analysis_signal_agreement"], 1.0
+        )
+
+    def test_custom_adx_threshold_is_respected(self):
+        strategy = BasicStrategy(adx_threshold=40.0)
+        metadata = make_passing_indicators()
+        metadata["indicators"]["adx"] = 30.0  # passes default 25, fails custom 40
+        context = self._bullish_context(metadata=metadata)
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.HOLD)
+
+    def test_custom_indicator_key_names_are_respected(self):
+        strategy = BasicStrategy(
+            ema_fast_key="fast_ema",
+            ema_slow_key="slow_ema",
+            adx_key="adx14",
+            atr_key="atr14",
+            atr_ma_key="atr14_ma20",
+        )
+        context = self._bullish_context(
+            metadata={
+                "indicators": {
+                    "fast_ema": 105.0,
+                    "slow_ema": 100.0,
+                    "adx14": 30.0,
+                    "atr14": 2.5,
+                    "atr14_ma20": 2.0,
+                }
+            }
+        )
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.BUY)
+
+    def test_custom_entry_filter_metadata_key_is_respected(self):
+        strategy = BasicStrategy(entry_filter_metadata_key="trend_indicators")
+        context = self._bullish_context(
+            metadata={"trend_indicators": make_passing_indicators()["indicators"]}
+        )
+        result = strategy.decide(context)
+        self.assertEqual(result.action, SignalDirection.BUY)
+
+    def test_summary_notes_entry_filter_downgrade(self):
+        strategy = BasicStrategy()
+        metadata = make_passing_indicators()
+        metadata["indicators"]["adx"] = 5.0
+        context = self._bullish_context(metadata=metadata)
+        result = strategy.decide(context)
+        self.assertIn("entry filters", result.summary)
+
+
+# ----------------------------------------------------------------------
 # Metadata / summary traceability
 # ----------------------------------------------------------------------
 class TestExplainability(unittest.TestCase):
@@ -426,6 +677,7 @@ class TestIntegration(unittest.TestCase):
             analysis_results=[make_analysis_result(score=0.7, confidence=0.85)],
             signal_result=make_signal_result(direction=SignalDirection.BUY, strength=0.75, confidence=0.8),
             risk_result=make_risk_result(approved=True, risk_score=0.25),
+            metadata=make_passing_indicators(),
         )
         result = strategy.decide(context)
         self.assertEqual(result.action, SignalDirection.BUY)

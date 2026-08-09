@@ -160,12 +160,58 @@ Also contains (Portfolio Management Part 1 -- foundation, new this milestone):
       `strategies/`; see `strategies/portfolio_management/__init__.py`
       for full detail.
 
+Contents (Trend Pullback SMC Strategy -- new concrete strategy, additive):
+    - `TrendPullbackSMCStrategy` (`trend_pullback_smc_strategy.py`): a
+      second concrete `BaseStrategy`, implementing a BTCUSDT-oriented
+      Trend Following + Pullback + Price Action + Smart Money Concepts
+      strategy. Unlike `BasicStrategy` (which decides from an
+      already-computed `AnalysisResult`), this strategy is
+      self-sufficient: it reads its own raw OHLCV candle history from
+      `StrategyContext.metadata` (the same free-form extension point
+      `BasicStrategy`'s own entry filters and `backtesting.
+      basic_backtester.BasicBacktester` already use) and computes its
+      own EMA 20/50/100/200 stack (alignment/slope/trend direction),
+      RSI 14 zones, MACD 12/26/9 (histogram + zero-line filter), ADX 14
+      + DI confirmation, fractal swing-point structure (HH/HL/LH/LL,
+      BOS, CHOCH), a confirmation-candle check, and three Smart Money
+      confirmations (liquidity sweep, order-block retest, fair-value-gap
+      fill) -- reusing `indicators.ema.EMA`/`rsi.RSI`/`macd.MACD`/
+      `adx.ADX`/`atr.ATR` exactly as they already exist. A higher-
+      timeframe bias (4H by default) is resolved from either explicit
+      higher-timeframe candles in `metadata` or a matching `AnalysisResult.
+      timeframe` already present on the context -- either is optional,
+      and its absence blocks new entries rather than raising. Long/short
+      entries each require every configured gate (higher-timeframe bias,
+      EMA alignment + direction, momentum confirmation, pullback,
+      structure confirmation, SMC confirmation, confirmation candle) to
+      pass; an unapproved `RiskResult` downgrades a would-be entry to
+      HOLD, the same convention `BasicStrategy` already uses. Every
+      intermediate value is recorded in `StrategyResult.metadata` for
+      full traceability. Phase 1 scope: decision logic only -- no order
+      execution, no live trading, no optimization, no UI (see the
+      module docstring for the full boundary list). Reuses Part 1
+      (`BaseStrategy`/`StrategyContext`/`StrategyResult`/exceptions/
+      utils) and `indicators/` exactly as they already exist;
+      `strategies.basic_strategy`, `strategies.aggregator`,
+      `strategies.risk_management`, `analysis/`, `signals/`,
+      `backtesting/`, and `core/` were all left completely untouched.
+      Only this `strategies/__init__.py` (to export
+      `TrendPullbackSMCStrategy`) was updated among existing files. See
+      `trend_pullback_smc_strategy.py` for the full requirement ->
+      implementation mapping. 31 dedicated tests in
+      `tests/test_trend_pullback_smc_strategy.py`.
+
 Planned contents (future Strategy Engine / Portfolio Management parts):
-    - Additional concrete strategies (e.g. trend_following_strategy.py,
-      mean_reversion_strategy.py) subclassing `BaseStrategy`.
+    - Additional concrete strategies (e.g. mean_reversion_strategy.py)
+      subclassing `BaseStrategy`.
     - A first concrete `BasePortfolioManager` implementation and,
       eventually, allocation/sizing/rebalancing logic across multiple
       assets -- all out of scope for Portfolio Management Part 1.
+    - `execution/`-layer wiring for `TrendPullbackSMCStrategy` (a
+      concrete `BaseExecutionEngine`, order placement, and a
+      `BaseBacktester` that supplies candle-derived
+      `StrategyContext.metadata` per step) remains future work, out of
+      scope for this strategy's Phase 1.
 
 `BasicStrategy` is the first trading decision this package actually
 produces; `risk_management` still only evaluates whether a candidate
@@ -189,10 +235,12 @@ from strategies.exceptions import (
     StrategyValidationError,
 )
 from strategies.result import StrategyResult
+from strategies.trend_pullback_smc_strategy import TrendPullbackSMCStrategy
 
 __all__ = [
     "BaseStrategy",
     "BasicStrategy",
+    "TrendPullbackSMCStrategy",
     "StrategyAggregator",
     "StrategyContext",
     "StrategyResult",

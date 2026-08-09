@@ -283,14 +283,14 @@ class TestBacktestRunnerRun(BaseBacktestRunnerTest):
         # BacktestRunner now runs its own Analysis -> Signal stages for
         # every historical candle before calling BasicStrategy.decide(),
         # so a real AnalysisResult/SignalResult is genuinely available.
-        # Against this deterministic, steadily-rising synthetic price
-        # series (see tests/helpers.FakeBinanceClient), that is enough
-        # for BasicStrategy to decide BUY on the very first candle and
-        # never SELL again (the trend never reverses), opening exactly
-        # one position that stays open for the rest of the run.
+        # BasicStrategy's entry filters (EMA50/EMA200, ADX, ATR expansion)
+        # are mandatory for any BUY, and BacktestRunner's pipeline never
+        # populates StrategyContext.metadata["indicators"], so every
+        # would-be BUY correctly fails closed to HOLD for lack of that
+        # data -- zero trades, not zero strategy results.
         runner = BacktestRunner(self.engine)
         run_result = runner.run("BTCUSDT", "1h")
-        self.assertEqual(run_result.result.trade_count(), 1)
+        self.assertEqual(run_result.result.trade_count(), 0)
         self.assertEqual(run_result.result.metadata.get("skipped_candles"), 0)
         self.assertEqual(run_result.metadata["candles_with_strategy_result"], 200)
 
@@ -407,18 +407,17 @@ class TestBacktestRunnerIntegration(BaseBacktestRunnerTest):
 
         self.assertIsInstance(run_result.result, BacktestResult)
         self.assertIsInstance(run_result.metrics, BacktestMetrics)
-        # BacktestMetrics.total_trades counts *closed* positions only
-        # (see backtesting/metrics.py's calculate_metrics), so it is not
-        # generally equal to the raw BUY+SELL trade_count() -- a BUY
-        # that is never followed by a SELL (exactly what happens here,
-        # replaying BasicStrategy against a steadily-rising synthetic
-        # series that never triggers a SELL) leaves one trade recorded
-        # but zero *closed* positions. What matters is that
-        # BacktestRunner's own Analysis -> Signal stages gave
-        # BasicStrategy enough real data to genuinely trade at all.
-        self.assertEqual(run_result.result.trade_count(), 1)
+        # BasicStrategy's entry filters (EMA50/EMA200, ADX, ATR expansion)
+        # are mandatory for any BUY, and BacktestRunner's own Analysis ->
+        # Signal stages never populate
+        # StrategyContext.metadata["indicators"], so every would-be BUY
+        # here correctly fails closed to HOLD for lack of that data --
+        # what matters is that this real, non-fake pipeline (BasicStrategy
+        # + BasicBacktester + calculate_metrics + BacktestReport) runs
+        # end-to-end without error and opens no untested positions.
+        self.assertEqual(run_result.result.trade_count(), 0)
         self.assertEqual(run_result.metrics.total_trades, 0)
-        self.assertEqual(run_result.metrics.open_positions_remaining, 1)
+        self.assertEqual(run_result.metrics.open_positions_remaining, 0)
 
     def test_scope_boundary_no_ai_no_execution_fields(self):
         runner = BacktestRunner(self.engine)

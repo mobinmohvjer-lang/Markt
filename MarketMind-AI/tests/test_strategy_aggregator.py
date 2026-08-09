@@ -52,10 +52,31 @@ TIMEFRAME = "1h"
 # ----------------------------------------------------------------------
 # Local test factories
 # ----------------------------------------------------------------------
-def make_strategy_context(analysis_results: list | None = None) -> StrategyContext:
+def make_strategy_context(
+    analysis_results: list | None = None, *, metadata: dict | None = None
+) -> StrategyContext:
     return StrategyContext(
-        symbol=SYMBOL, timeframe=TIMEFRAME, analysis_results=analysis_results or []
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        analysis_results=analysis_results or [],
+        metadata=metadata if metadata is not None else {},
     )
+
+
+def make_passing_entry_filter_indicators() -> dict:
+    # BasicStrategy's entry filters (EMA50/EMA200, ADX, ATR expansion)
+    # are mandatory for any BUY -- see strategies/basic_strategy.py.
+    # Real-BasicStrategy integration tests below that expect BUY must
+    # supply indicator values that clear all three.
+    return {
+        "indicators": {
+            "ema_50": 105.0,
+            "ema_200": 100.0,
+            "adx": 30.0,
+            "atr": 2.5,
+            "atr_ma_20": 2.0,
+        }
+    }
 
 
 def make_analysis_result(
@@ -536,7 +557,9 @@ class TestDecideOutputShape(unittest.TestCase):
 class TestRealBasicStrategyIntegration(unittest.TestCase):
     def test_two_agreeing_basic_strategies_yield_buy(self):
         analysis = make_analysis_result(score=0.7, confidence=0.85)
-        ctx = make_strategy_context(analysis_results=[analysis])
+        ctx = make_strategy_context(
+            analysis_results=[analysis], metadata=make_passing_entry_filter_indicators()
+        )
 
         aggregator = StrategyAggregator(
             strategies=[
@@ -556,7 +579,9 @@ class TestRealBasicStrategyIntegration(unittest.TestCase):
         # threshold and HOLD under a high one, so the two real
         # BasicStrategy instances genuinely disagree.
         analysis = make_analysis_result(score=0.25, confidence=0.9)
-        ctx = make_strategy_context(analysis_results=[analysis])
+        ctx = make_strategy_context(
+            analysis_results=[analysis], metadata=make_passing_entry_filter_indicators()
+        )
 
         aggregator = StrategyAggregator(
             strategies=[
@@ -596,7 +621,9 @@ class TestRealBasicStrategyIntegration(unittest.TestCase):
 
     def test_default_construction_uses_real_basic_strategy(self):
         analysis = make_analysis_result(score=0.6, confidence=0.8)
-        ctx = make_strategy_context(analysis_results=[analysis])
+        ctx = make_strategy_context(
+            analysis_results=[analysis], metadata=make_passing_entry_filter_indicators()
+        )
         result = StrategyAggregator().decide(ctx)
         self.assertEqual(result.action, SignalDirection.BUY)
 

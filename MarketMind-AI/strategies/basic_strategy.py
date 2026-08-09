@@ -43,6 +43,21 @@ deterministic, fully-explained steps:
        `HOLD` rather than silently ignoring the conflict. A `HOLD`
        action is never overridden -- there is nothing for risk to
        approve or reject when no trade is being proposed.
+    4. **Entry filters (BUY only, mandatory).** Once a `BUY` survives
+       the risk gate, it must additionally clear three trend/volatility
+       filters before it is allowed through: `EMA50 > EMA200`,
+       `ADX >= 25`, and `ATR` above its own 20-candle moving average.
+       These values are read from `StrategyContext.metadata["indicators"]`
+       (configurable key names -- see `Attributes` below). The filters
+       are always active and strict: a missing metadata key, or a
+       missing/non-numeric individual value once present, counts as
+       that filter failing -- there is never enough missing data to
+       skip the check, only enough to fail it. A `SELL`/`HOLD` action
+       is never affected by this step; a `BUY` that fails is downgraded
+       to `HOLD` (`metadata["entry_filter_override"] = True`) -- the
+       same "downgrade, never invent a different action" shape the risk
+       gate above already uses. Existing scoring/consistency/confidence/
+       risk logic is unchanged; this step only gates the final `BUY`.
 
 `confidence` combines each contributing result's own `confidence`
 (weighted the same way `overall_score` is), the consistency score from
@@ -82,10 +97,31 @@ Strategy Engine parts.
 No change to `strategies.base_strategy`/`context`/`result`/
 `exceptions`/`utils`, `strategies.risk_management`, `analysis/`, or
 `signals/` -- all consumed exactly as they already exist.
+
+Entry filters (added on top of the above; see step 4 in "Scope")
+------------------------------------------------------------------
+When the caller supplies `StrategyContext.metadata["indicators"]`
+(configurable key), `BasicStrategy` additionally requires, before any
+`BUY` is returned:
+
+    1. `EMA50 > EMA200` (uptrend).
+    2. `ADX >= 25` (trending market, not chop).
+    3. `ATR > ATR`'s own moving average of the previous 20 candles
+       (expanding volatility).
+
+If any of the three fails -- including an individual indicator being
+absent or non-numeric, or the whole `"indicators"` metadata key being
+absent -- the action is downgraded to `HOLD`, exactly like the
+existing risk gate. There is no way to opt out: insufficient data
+fails the filter it concerns rather than bypassing it. Stop loss,
+take profit, trailing stop, position sizing, and risk management are
+untouched: this is purely an additional gate in front of the `BUY`
+action this module already computes.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 from core.enums import SignalDirection
@@ -113,6 +149,24 @@ DEFAULT_BUY_THRESHOLD = 0.2
 #: `signal` is corroborating evidence when present.
 DEFAULT_ANALYSIS_WEIGHT = 0.6
 DEFAULT_SIGNAL_WEIGHT = 0.4
+
+#: `StrategyContext.metadata` key under which the raw indicator values
+#: used by the entry filters (EMA50/EMA200/ADX/ATR/ATR moving average)
+#: are looked up. Free-form, caller-supplied context, the same
+#: `StrategyContext.metadata` extension point the class already
+#: documents -- never a new domain concept.
+DEFAULT_ENTRY_FILTER_METADATA_KEY = "indicators"
+
+#: Default indicator key names looked up inside that nested dict.
+DEFAULT_EMA_FAST_KEY = "ema_50"
+DEFAULT_EMA_SLOW_KEY = "ema_200"
+DEFAULT_ADX_KEY = "adx"
+DEFAULT_ATR_KEY = "atr"
+DEFAULT_ATR_MA_KEY = "atr_ma_20"
+
+#: ADX strictly below this value is considered a non-trending ("choppy")
+#: market; entry filter 2 requires `ADX >= DEFAULT_ADX_THRESHOLD`.
+DEFAULT_ADX_THRESHOLD = 25.0
 
 #: Maps `core.enums.SignalDirection` onto a signed multiplier, used to
 #: turn a `SignalResult`'s categorical `direction` + `strength` into a
@@ -151,13 +205,29 @@ class BasicStrategy(BaseStrategy):
         signal_weight: Relative weight given to the signal-derived
             score/confidence, used only when a `SignalResult` is
             present. Must be finite and `>= 0.0`.
+        entry_filter_metadata_key: `StrategyContext.metadata` key under
+            which the indicator values for the entry filters are
+            looked up (a nested dict). Must be a non-empty string.
+        ema_fast_key / ema_slow_key: Keys, inside that nested dict, of
+            the EMA50/EMA200 values used by entry filter 1
+            (`EMA50 > EMA200`). Must be non-empty strings.
+        adx_key: Key, inside that nested dict, of the ADX value used by
+            entry filter 2. Must be a non-empty string.
+        adx_threshold: Entry filter 2 requires `ADX >= adx_threshold`.
+            Must be a finite number in `[0.0, 100.0]`.
+        atr_key / atr_ma_key: Keys, inside that nested dict, of the ATR
+            value and its 20-candle moving average used by entry
+            filter 3 (`ATR > ATR moving average`). Must be non-empty
+            strings.
 
     Raises:
-        StrategyConfigurationError: If `analysis_analyzer_name` is not
-            a non-empty string, `buy_threshold`/`sell_threshold` are
-            not finite numbers within their documented ranges, or
-            `analysis_weight`/`signal_weight` are not finite,
-            non-negative numbers.
+        StrategyConfigurationError: If `analysis_analyzer_name` (or any
+            of `entry_filter_metadata_key`, `ema_fast_key`,
+            `ema_slow_key`, `adx_key`, `atr_key`, `atr_ma_key`) is not
+            a non-empty string, `buy_threshold`/`sell_threshold`/
+            `adx_threshold` are not finite numbers within their
+            documented ranges, or `analysis_weight`/`signal_weight`
+            are not finite, non-negative numbers.
     """
 
     def __init__(
@@ -169,15 +239,19 @@ class BasicStrategy(BaseStrategy):
         sell_threshold: float = DEFAULT_SELL_THRESHOLD,
         analysis_weight: float = DEFAULT_ANALYSIS_WEIGHT,
         signal_weight: float = DEFAULT_SIGNAL_WEIGHT,
+        entry_filter_metadata_key: str = DEFAULT_ENTRY_FILTER_METADATA_KEY,
+        ema_fast_key: str = DEFAULT_EMA_FAST_KEY,
+        ema_slow_key: str = DEFAULT_EMA_SLOW_KEY,
+        adx_key: str = DEFAULT_ADX_KEY,
+        adx_threshold: float = DEFAULT_ADX_THRESHOLD,
+        atr_key: str = DEFAULT_ATR_KEY,
+        atr_ma_key: str = DEFAULT_ATR_MA_KEY,
     ) -> None:
         super().__init__(name=name)
 
-        if not isinstance(analysis_analyzer_name, str) or not analysis_analyzer_name.strip():
-            raise StrategyConfigurationError(
-                f"analysis_analyzer_name must be a non-empty string, "
-                f"got {analysis_analyzer_name!r}"
-            )
-        self.analysis_analyzer_name = analysis_analyzer_name
+        self.analysis_analyzer_name = self._validate_non_empty_str(
+            analysis_analyzer_name, name="analysis_analyzer_name"
+        )
 
         self.buy_threshold = self._validate_threshold(
             buy_threshold, name="buy_threshold", low=0.0, high=1.0, low_inclusive=False
@@ -188,6 +262,18 @@ class BasicStrategy(BaseStrategy):
 
         self.analysis_weight = self._validate_weight(analysis_weight, name="analysis_weight")
         self.signal_weight = self._validate_weight(signal_weight, name="signal_weight")
+
+        self.entry_filter_metadata_key = self._validate_non_empty_str(
+            entry_filter_metadata_key, name="entry_filter_metadata_key"
+        )
+        self.ema_fast_key = self._validate_non_empty_str(ema_fast_key, name="ema_fast_key")
+        self.ema_slow_key = self._validate_non_empty_str(ema_slow_key, name="ema_slow_key")
+        self.adx_key = self._validate_non_empty_str(adx_key, name="adx_key")
+        self.adx_threshold = self._validate_threshold(
+            adx_threshold, name="adx_threshold", low=0.0, high=100.0
+        )
+        self.atr_key = self._validate_non_empty_str(atr_key, name="atr_key")
+        self.atr_ma_key = self._validate_non_empty_str(atr_ma_key, name="atr_ma_key")
 
     # ------------------------------------------------------------------
     # Construction-time validation
@@ -214,6 +300,12 @@ class BasicStrategy(BaseStrategy):
                 f"{']' if high_inclusive else ')'}, got {numeric_value}"
             )
         return numeric_value
+
+    @staticmethod
+    def _validate_non_empty_str(value: Any, *, name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise StrategyConfigurationError(f"{name} must be a non-empty string, got {value!r}")
+        return value
 
     @staticmethod
     def _validate_weight(value: Any, *, name: str) -> float:
@@ -290,6 +382,16 @@ class BasicStrategy(BaseStrategy):
 
         final_action = SignalDirection.HOLD if risk_override else raw_action
 
+        # -------- entry filters (BUY only) --------
+        # Applied after the risk gate: a BUY the risk gate already
+        # downgraded to HOLD has nothing left to filter. Existing
+        # SELL/HOLD logic above is completely unaffected.
+        entry_filters = self._evaluate_entry_filters(context)
+        entry_filter_override = False
+        if final_action == SignalDirection.BUY and not entry_filters["passed"]:
+            entry_filter_override = True
+            final_action = SignalDirection.HOLD
+
         # -------- confidence --------
         confidence_components: list[tuple[float, float]] = [
             (analysis_result.confidence, self.analysis_weight)
@@ -311,6 +413,7 @@ class BasicStrategy(BaseStrategy):
             confidence=confidence,
             consistency_score=consistency_score,
             risk_override=risk_override,
+            entry_filter_override=entry_filter_override,
             signal_available=signal_available,
             risk_available=risk_available,
         )
@@ -325,6 +428,8 @@ class BasicStrategy(BaseStrategy):
             signal_score=signal_score,
             risk_result=risk_result,
             risk_available=risk_available,
+            entry_filters=entry_filters,
+            entry_filter_override=entry_filter_override,
             overall_score=overall_score,
             raw_action=raw_action,
             final_action=final_action,
@@ -387,6 +492,86 @@ class BasicStrategy(BaseStrategy):
             return sum(values) / len(values) if values else 0.0
         return sum(value * weight for value, weight in components) / total_weight
 
+    @staticmethod
+    def _is_finite_number(value: Any) -> bool:
+        """`True` for a non-boolean `int`/`float` that is finite (not NaN/inf)."""
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(
+            value
+        )
+
+    def _evaluate_entry_filters(self, context: StrategyContext) -> dict[str, Any]:
+        """
+        Evaluate the three BUY-only entry filters against indicator
+        values read from `context.metadata[self.entry_filter_metadata_key]`.
+
+        The filters are mandatory for every BUY: if the caller never
+        populated that key with a dict at all (`"available": False`
+        below), or if any of the three individual values inside it are
+        missing or non-numeric, that counts as the corresponding filter
+        failing -- insufficient data is never "assumed passed", it fails
+        closed to `HOLD` exactly like an explicit failing value would.
+
+        Returns a metadata-ready dict recording each filter's inputs
+        and outcome plus an overall `"passed"` bool.
+        """
+        raw_indicators = context.metadata.get(self.entry_filter_metadata_key)
+        available = isinstance(raw_indicators, dict)
+        indicators = raw_indicators if available else {}
+        # Mandatory: an absent/non-dict metadata key means every individual
+        # lookup below returns `None`, which `_is_finite_number` rejects --
+        # so `passed` naturally comes out `False` (fails closed to HOLD)
+        # rather than being skipped.
+
+        ema_fast = indicators.get(self.ema_fast_key)
+        ema_slow = indicators.get(self.ema_slow_key)
+        ema_trend_ok = (
+            self._is_finite_number(ema_fast)
+            and self._is_finite_number(ema_slow)
+            and ema_fast > ema_slow
+        )
+
+        adx = indicators.get(self.adx_key)
+        adx_ok = self._is_finite_number(adx) and adx >= self.adx_threshold
+
+        atr = indicators.get(self.atr_key)
+        atr_ma = indicators.get(self.atr_ma_key)
+        atr_expansion_ok = (
+            self._is_finite_number(atr) and self._is_finite_number(atr_ma) and atr > atr_ma
+        )
+
+        # Mandatory for every BUY: all three must hold. Missing indicator
+        # metadata (or a missing/non-numeric individual value within it)
+        # counts as that filter failing, never as a bypass.
+        passed = ema_trend_ok and adx_ok and atr_expansion_ok
+
+        return {
+            "available": available,
+            "passed": passed,
+            "ema_trend": {
+                "description": "EMA50 > EMA200",
+                "fast_indicator": self.ema_fast_key,
+                "slow_indicator": self.ema_slow_key,
+                "fast_value": ema_fast,
+                "slow_value": ema_slow,
+                "passed": ema_trend_ok,
+            },
+            "adx": {
+                "description": "ADX >= threshold",
+                "indicator": self.adx_key,
+                "value": adx,
+                "threshold": self.adx_threshold,
+                "passed": adx_ok,
+            },
+            "atr_expansion": {
+                "description": "ATR > ATR moving average of previous 20 candles",
+                "atr_indicator": self.atr_key,
+                "atr_ma_indicator": self.atr_ma_key,
+                "atr_value": atr,
+                "atr_ma_value": atr_ma,
+                "passed": atr_expansion_ok,
+            },
+        }
+
     # ------------------------------------------------------------------
     # Presentation helpers
     # ------------------------------------------------------------------
@@ -400,6 +585,7 @@ class BasicStrategy(BaseStrategy):
         confidence: float,
         consistency_score: float,
         risk_override: bool,
+        entry_filter_override: bool,
         signal_available: bool,
         risk_available: bool,
     ) -> str:
@@ -418,6 +604,11 @@ class BasicStrategy(BaseStrategy):
                 f"downgraded from {raw_action.value.upper()} because the risk "
                 f"evaluation did not approve it"
             )
+        if entry_filter_override:
+            notes.append(
+                f"downgraded from {raw_action.value.upper()} because the entry "
+                f"filters (EMA50/EMA200, ADX, ATR expansion) did not all pass"
+            )
         if notes:
             summary += " [" + "; ".join(notes) + "]"
         return summary + "."
@@ -434,6 +625,8 @@ class BasicStrategy(BaseStrategy):
         signal_score: Optional[float],
         risk_result: Any,
         risk_available: bool,
+        entry_filters: dict[str, Any],
+        entry_filter_override: bool,
         overall_score: float,
         raw_action: SignalDirection,
         final_action: SignalDirection,
@@ -454,6 +647,8 @@ class BasicStrategy(BaseStrategy):
             "raw_action": raw_action.value,
             "final_action": final_action.value,
             "risk_override": risk_override,
+            "entry_filter_override": entry_filter_override,
+            "entry_filters": entry_filters,
             "analysis": {
                 "available": True,
                 "analyzer_name": analysis_result.analyzer_name,
